@@ -88,7 +88,8 @@ ensure_required_attributes!(g::SyntaxGraph) = ensure_attributes!(
     source=SourceAttrType,
     syntax_flags=UInt16,
     value=Any,
-    name_val=String)
+    name_val=String,
+    mod=Module)
 
 function delete_attributes!(graph::SyntaxGraph{<:Dict}, attr_names::Symbol...)
     for name in attr_names
@@ -338,13 +339,15 @@ end
 
 # Reference to bytes within a source file
 struct SourceRef
-    file::SourceFile
-    first_byte::Int
-    last_byte::Int
+    file::Base.RefValue{SourceFile}
+    first_byte::UInt32
+    last_byte::UInt32
 end
 
-sourcefile(src::SourceRef) = src.file
-byte_range(src::SourceRef) = src.first_byte:src.last_byte
+sourcefile(src::SourceRef) = src.file[]
+first_byte(src::SourceRef) = Int(src.first_byte)
+last_byte(src::SourceRef) = Int(src.last_byte)
+byte_range(src::SourceRef) = first_byte(src):last_byte(src)
 
 # TODO: Adding these methods to support LineNumberNode is kind of hacky but we
 # can remove these after JuliaLowering becomes self-bootstrapping for macros
@@ -366,7 +369,7 @@ function highlight(io::IO, src::LineNumberNode; note="")
 end
 
 function highlight(io::IO, src::SourceRef; kws...)
-    highlight(io, src.file, first_byte(src):last_byte(src); kws...)
+    highlight(io, sourcefile(src), first_byte(src):last_byte(src); kws...)
 end
 
 function Base.show(io::IO, ::MIME"text/plain", src::SourceRef)
@@ -1198,7 +1201,7 @@ function build_tree(::Type{SyntaxTree}, stream::ParseStream;
                     filename=nothing, first_line=1)
     cursor = RedTreeCursor(stream)
     graph = SyntaxGraph()
-    sf = SourceFile(stream; filename, first_line)
+    sf = Ref(SourceFile(stream; filename, first_line))
     source = SourceRef(sf, first_byte(stream), last_byte(stream))
     cs = SyntaxList(graph)
     for c in reverse_toplevel_siblings(cursor)
@@ -1214,12 +1217,12 @@ function build_tree(::Type{SyntaxTree}, stream::ParseStream;
     return SyntaxTree(graph, id)
 end
 
-function SyntaxTree(graph::SyntaxGraph, sf::SourceFile, cursor::RedTreeCursor)
+function SyntaxTree(graph::SyntaxGraph, sf::Base.RefValue{SourceFile}, cursor::RedTreeCursor)
     ensure_attributes!(graph, kind=Kind, syntax_flags=UInt16,
                        source=SourceAttrType, value=Any, name_val=String)
     green_id = GC.@preserve sf begin
-        raw_offset, txtbuf = _unsafe_wrap_substring(sf.code)
-        offset = raw_offset - sf.byte_offset
+        raw_offset, txtbuf = _unsafe_wrap_substring(sf[].code)
+        offset = raw_offset - sf[].byte_offset
         _insert_green(graph, sf, txtbuf, offset, cursor)
     end
     gst = SyntaxTree(graph, green_id)
@@ -1228,7 +1231,7 @@ function SyntaxTree(graph::SyntaxGraph, sf::SourceFile, cursor::RedTreeCursor)
     return out
 end
 
-function _insert_green(graph::SyntaxGraph, sf::SourceFile,
+function _insert_green(graph::SyntaxGraph, sf::Base.RefValue{SourceFile},
                        txtbuf::Vector{UInt8}, offset::Int,
                        cursor::RedTreeCursor)
     id = new_id!(graph)
@@ -1287,6 +1290,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
     k = kind(st)
     coreref(s::String) = setattr!(newleaf(graph, st, K"core"), :name_val, s)
     symleaf(s::String) = setattr!(newleaf(graph, st, K"Identifier"), :name_val, s)
+    core_globalref(s::String) = setattr!(symleaf(s), :mod, Core)
     valleaf(@nospecialize(v)) = setattr!(newleaf(graph, st, K"Value"), :value, v)
 
     if is_leaf(st)
@@ -1300,7 +1304,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
             # which added this to match flisp parsing text->Expr.
             macname = v isa Int128 ? "@int128_str" :
                 v isa UInt128 ? "@uint128_str" : "@big_str"
-            mac = valleaf(GlobalRef(Core, Symbol(macname)))
+            mac = core_globalref(macname)
             arg = valleaf(replace(sourcetext(st), '_'=>""))
             ret_cids = tree_ids(mac, coreref("nothing"), arg)
             newnode(graph, st, K"macrocall", ret_cids)
@@ -1325,7 +1329,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
         cmd_arg = _string_to_est(st, cs; unwrap_literal=true)
         loc_st = valleaf(source_location(LineNumberNode, st))
         return newnode(graph, st, K"macrocall", tree_ids(
-            valleaf(GlobalRef(Core, Symbol("@cmd"))), loc_st, cmd_arg))
+            core_globalref("@cmd"), loc_st, cmd_arg))
     elseif k === K"macro_name" && n_cs === 1
         # "M.@x" => (. M (macro_name x)) => (. M @x)
         # "@M.x" => (macro_name (. M x)) => (. M @x)
@@ -1387,7 +1391,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
         # (doc str obj) => (macrocall Core.@doc lno str obj)
         ret_k = K"macrocall"
         pushfirst!(cs, valleaf(source_location(LineNumberNode, st)))
-        pushfirst!(cs, valleaf(GlobalRef(Core, Symbol("@doc"))))
+        pushfirst!(cs, core_globalref("@doc"))
     elseif k === K"dotcall" || k === K"call" && n_cs > 0
         if is_infix_op_call(st) || is_postfix_op_call(st)
             cs[2], cs[1] = cs[1], cs[2]

@@ -1733,7 +1733,7 @@ function expand_C_library_symbol(ctx, ex)
 end
 
 function expand_ccall(ctx, ex)
-    @jl_assert kind(ex) == K"call" && is_core_ref(ex[1], "ccall") ex
+    @jl_assert kind(ex) == K"call" ex
     if numchildren(ex) < 4
         throw(LoweringError(ex, "too few arguments to ccall"))
     end
@@ -1908,12 +1908,11 @@ end
 
 function expand_call(ctx, ex)
     farg = ex[1]
-    if is_core_ref(farg, "ccall")
+    if kind(farg) === K"Identifier" && farg.name_val === "ccall"
         return expand_ccall(ctx, ex)
-    elseif is_core_ref(farg, "cglobal")
-        @jl_assert numchildren(ex) in 2:3  (ex, "cglobal must have one or two arguments")
+    elseif kind(farg) === K"Identifier" && farg.name_val === "cglobal"
         return @ast ctx ex [K"call"
-            ex[1]
+            [K"static_eval" ex[1]] # just so the globalref is inlined
             expand_forms_2(ctx, ex[2])
             if numchildren(ex) == 3
                 expand_forms_2(ctx, ex[3])
@@ -2417,7 +2416,8 @@ end
 # - one wrapper per optional positional arg
 # - one containing the body
 # - possibly one generated method
-function method_def_expr(ctx, src, mtable, sparams, argl, body, rett)
+function method_def_expr(ctx, src, mtable, sparams, argl, body,
+                         rett=@ast(ctx, src, "Any"::K"core"))
     @jl_assert length(argl) > 0 src
     @jl_assert kind(argl[end]) !== K"parameters" src argl[end]
     if length(pos_opt_args(argl)) > 0
@@ -2569,7 +2569,7 @@ function optional_positional_defs(ctx, src, mtable, sparams, argl, body, rett)
         end
         push!(methods, method_def_expr(
             ctx, src, mtable, used_typevars(passed, sparams),
-            passed, wrapper_body, rett))
+            passed, wrapper_body))
         push!(passed, opt_decls[i])
     end
     if length(opt) + length(req) < length(argl)
@@ -2639,7 +2639,9 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, p
         newsym(ctx, argl[1], reserve_module_binding_i(ctx.mod, mangled))
     end
     # (1) Body method.  This contains the actual function body, and requires
-    # every possible default to be filled.
+    # (1) Body method.  This contains the actual function body, and requires
+    # every possible default to be filled.  `rett` is only passed here since it
+    # can reference any argument.
     mdefs1 = let arg1 = @ast ctx m1_name [K"::" m1_name [K"function_type" m1_name]]
         nkw = @ast ctx kws [K"meta" "nkw"::K"Symbol" numchildren(kws)::K"Value"]
         method_def_expr(
@@ -2661,7 +2663,7 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, p
         end
         method_def_expr(
             ctx, src, mtable, positional_sparams, pargl,
-            @ast(ctx, src, [K"block" [K"return" body2]]), rett)
+            @ast(ctx, src, [K"block" [K"return" body2]]))
     end
     # (3) Core.kwcall(arg2::NamedTuple, pargl...) methods (one per optarg).
     # - for each kwarg:
@@ -2750,7 +2752,7 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, p
             arg2 = @ast ctx arg2_name [K"::" arg2_name "NamedTuple"::K"core"]
             method_def_expr(
                 ctx, src, mtable, positional_sparams,
-                SyntaxList(arg1, arg2, pargl...), kwcall_body, rett)
+                SyntaxList(arg1, arg2, pargl...), kwcall_body)
         end
     end
     @ast ctx src [K"block"
@@ -2798,8 +2800,6 @@ function expand_function_arg1(ctx, arg)
         _ -> newsym(ctx, arg, "#self#")
     end
     atype = @stm arg begin
-        [K"curly" _ _...] -> @ast ctx arg [K"function_type" arg]
-        [K"where" _ _...] -> @ast ctx arg [K"function_type" arg]
         [K"::" t] -> t
         [K"::" _ t] -> t
         _ -> @ast ctx arg [K"function_type" arg]
@@ -3201,6 +3201,11 @@ function _collect_struct_fields(ctx, field_names, field_types, field_attrs, fiel
             m = _match_struct_field(e)
             if !isnothing(m)
                 # Struct field
+                for prev in field_names
+                    if prev.name_val == m.name.name_val
+                        throw(LoweringError(m.name, "duplicate field name"))
+                    end
+                end
                 push!(field_names, m.name)
                 n = length(field_names)
                 push!(field_types, isnothing(m.type) ? @ast(ctx, e, "Any"::K"core") : m.type)
